@@ -158,6 +158,19 @@ if decomp, ok := format.(archives.Decompressor); ok {
 
 `Identify()` works by reading an arbitrary number of bytes from the beginning of the stream (just enough to check for file headers). It buffers them and returns a new reader that lets you re-read them anew. If your input stream is `io.Seeker` however, no buffer is created as it uses `Seek()` instead, and the returned stream is the same as the input.
 
+If you need to bound the cost of probing before committing to a stream, use `IdentifyWithMaxBytes()`, which takes a byte budget for identification:
+
+```go
+format, stream, err := archives.IdentifyWithMaxBytes(ctx, "filename.tar.zst", stream, 1<<20)
+if errors.Is(err, archives.ErrMaxBytesReached) {
+	// the budget ran out before a conclusive match; retry with a larger budget
+} else if errors.Is(err, archives.NoMatch) {
+	// the input was probed, but no registered format matched it
+}
+```
+
+The budget only limits how many bytes may be read from the stream while identifying the format; the returned stream is not limited and still yields the complete input, so you can read or extract from it as usual, even when an error is returned. A budget of 0 or less means no limit, which is what `Identify()` uses.
+
 ### Virtual file systems
 
 This is my favorite feature.

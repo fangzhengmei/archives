@@ -37,12 +37,50 @@ func RegisterFormat(format Format) {
 // peeked bytes. However, if the stream is an io.Seeker, Seek() must
 // work, no extra buffering will be performed, and the original input
 // value will be returned at the original position by seeking.
+//
+// Identify does not limit how many bytes may be read from the stream
+// while matching; use IdentifyWithMaxBytes to bound the cost of probing.
 func Identify(ctx context.Context, filename string, stream io.Reader) (Format, io.Reader, error) {
+	return IdentifyWithMaxBytes(ctx, filename, stream, 0)
+}
+
+// IdentifyWithMaxBytes is like Identify, but it limits how many bytes may
+// be read from the stream while probing for a matching format. This allows
+// callers to bound the cost of identification before committing to reading
+// the stream. A maxBytes value of 0 or less means no limit, in which case
+// the results are the same as Identify.
+//
+// The limit only applies while identifying the format; the returned stream
+// is not limited and still contains all the bytes of the original stream,
+// including any that were buffered while probing, so it can be read in full
+// by the caller afterward (for example, to extract each file entry) without
+// repeating or skipping any data. This holds even when an error is returned.
+//
+// If the limit is reached before a conclusive match could be made, the
+// returned error wraps ErrMaxBytesReached, which is distinct from NoMatch:
+// NoMatch means the input was probed and no format matched, whereas
+// ErrMaxBytesReached means the byte budget ran out first and the caller
+// may retry with a larger budget.
+func IdentifyWithMaxBytes(ctx context.Context, filename string, stream io.Reader, maxBytes int64) (Format, io.Reader, error) {
 	var compression Compression
 	var archival Archival
 	var extraction Extraction
 
 	filename = path.Base(filepath.ToSlash(filename))
+
+	// if a byte budget was given, count the bytes read from the stream
+	// while probing; the limiter is lifted before returning so the
+	// caller gets an unbounded, complete stream to read afterward
+	var limiter *byteLimitReader
+	if stream != nil && maxBytes > 0 {
+		limiter = &byteLimitReader{r: stream, remaining: maxBytes}
+		if seeker, ok := stream.(io.Seeker); ok {
+			stream = &byteLimitSeekReader{byteLimitReader: limiter, seeker: seeker}
+		} else {
+			stream = limiter
+		}
+		defer limiter.lift()
+	}
 
 	rewindableStream, err := newRewindReader(stream)
 	if err != nil {
@@ -58,6 +96,9 @@ func Identify(ctx context.Context, filename string, stream io.Reader) (Format, i
 
 		matchResult, err := identifyOne(ctx, format, filename, rewindableStream, nil)
 		if err != nil {
+			return nil, rewindableStream.reader(), fmt.Errorf("matching %s: %w", name, err)
+		}
+		if err := limiter.errIfExceeded(); err != nil {
 			return nil, rewindableStream.reader(), fmt.Errorf("matching %s: %w", name, err)
 		}
 
@@ -79,6 +120,9 @@ func Identify(ctx context.Context, filename string, stream io.Reader) (Format, i
 
 		matchResult, err := identifyOne(ctx, format, filename, rewindableStream, compression)
 		if err != nil {
+			return nil, rewindableStream.reader(), fmt.Errorf("matching %s: %w", name, err)
+		}
+		if err := limiter.errIfExceeded(); err != nil {
 			return nil, rewindableStream.reader(), fmt.Errorf("matching %s: %w", name, err)
 		}
 
@@ -425,6 +469,150 @@ func (rr *rewindReader) reader() io.Reader {
 
 // NoMatch is a special error returned if there are no matching formats.
 var NoMatch = fmt.Errorf("no formats matched")
+
+// ErrMaxBytesReached is returned by IdentifyWithMaxBytes when the byte
+// budget for probing was exhausted before a conclusive match could be
+// made. It is distinct from NoMatch, which means the input was probed
+// and no registered format matched it.
+var ErrMaxBytesReached = errors.New("maximum number of bytes reached while identifying format")
+
+// byteLimitReader wraps a reader and allows at most a certain number of
+// bytes to be read from it. Once the budget is exhausted, Read returns
+// ErrMaxBytesReached (unless the underlying stream is at its end anyway,
+// in which case EOF is reported truthfully). The limit can be lifted,
+// after which the wrapped reader behaves like the underlying reader again,
+// without losing any bytes. It is used to bound the cost of format
+// identification without consuming the caller's stream.
+type byteLimitReader struct {
+	r         io.Reader
+	remaining int64
+	exceeded  bool
+	lifted    bool
+	stash     []byte // a byte read past the budget while probing for EOF
+}
+
+func (blr *byteLimitReader) Read(p []byte) (int, error) {
+	if blr.lifted {
+		if len(blr.stash) > 0 {
+			n := copy(p, blr.stash)
+			blr.stash = blr.stash[n:]
+			return n, nil
+		}
+		return blr.r.Read(p)
+	}
+	if blr.exceeded {
+		return 0, ErrMaxBytesReached
+	}
+	if blr.remaining == 0 {
+		return blr.probe()
+	}
+	if int64(len(p)) > blr.remaining {
+		p = p[:blr.remaining]
+	}
+	n, err := blr.r.Read(p)
+	blr.remaining -= int64(n)
+	return n, err
+}
+
+// probe is called when the budget is exactly exhausted. If the underlying
+// stream has no more data either, the budget was sufficient after all and
+// EOF (or whatever the underlying reader returns) is reported truthfully.
+// Otherwise the budget is genuinely exceeded; the byte read while probing
+// is stashed so no data is lost once the limit is lifted.
+func (blr *byteLimitReader) probe() (int, error) {
+	var b [1]byte
+	n, err := blr.r.Read(b[:])
+	if n > 0 {
+		blr.stash = append(blr.stash, b[:n]...)
+		blr.exceeded = true
+		return 0, ErrMaxBytesReached
+	}
+	return 0, err
+}
+
+// lift removes the read limit so the rest of the stream can be read freely.
+func (blr *byteLimitReader) lift() {
+	if blr != nil {
+		blr.lifted = true
+	}
+}
+
+// errIfExceeded returns ErrMaxBytesReached if the budget was exhausted
+// during probing. Some format matchers ignore read errors (treating them
+// as a non-match), so this lets the caller still tell an exhausted budget
+// apart from a genuine non-match.
+func (blr *byteLimitReader) errIfExceeded() error {
+	if blr != nil && blr.exceeded {
+		return ErrMaxBytesReached
+	}
+	return nil
+}
+
+// byteLimitSeekReader is a byteLimitReader that also implements io.Seeker
+// by delegating to the underlying stream, so that seekable inputs keep
+// their seek-based (unbuffered) identification behavior. Seeking does not
+// consume the budget; instead of counting cumulative reads, the budget
+// bounds how far past the starting position probing may read (its
+// high-water mark), since previously read positions can be re-seeked to.
+type byteLimitSeekReader struct {
+	*byteLimitReader
+	seeker   io.Seeker
+	pos      int64 // current position in the stream
+	start    int64 // position where identification started
+	posKnown bool
+}
+
+func (blsr *byteLimitSeekReader) Seek(offset int64, whence int) (int64, error) {
+	pos, err := blsr.seeker.Seek(offset, whence)
+	if err != nil {
+		return pos, err
+	}
+	if !blsr.posKnown {
+		blsr.start = pos
+		blsr.posKnown = true
+	}
+	blsr.pos = pos
+	return pos, nil
+}
+
+func (blsr *byteLimitSeekReader) Read(p []byte) (int, error) {
+	if blsr.lifted {
+		if len(blsr.stash) > 0 {
+			n := copy(p, blsr.stash)
+			blsr.stash = blsr.stash[n:]
+			return n, nil
+		}
+		return blsr.r.Read(p)
+	}
+	if blsr.exceeded {
+		return 0, ErrMaxBytesReached
+	}
+	allowed := blsr.remaining - (blsr.pos - blsr.start)
+	if allowed <= 0 {
+		// probe for EOF like byteLimitReader does, but a seeker can
+		// simply un-read the probed byte by seeking back
+		var b [1]byte
+		n, err := blsr.r.Read(b[:])
+		if n > 0 {
+			if _, serr := blsr.seeker.Seek(int64(-n), io.SeekCurrent); serr == nil {
+				blsr.exceeded = true
+				return 0, ErrMaxBytesReached
+			}
+			// could not un-read; stash the bytes so they are not
+			// lost once the limit is lifted
+			blsr.stash = append(blsr.stash, b[:n]...)
+			blsr.exceeded = true
+			return 0, ErrMaxBytesReached
+		}
+		return 0, err
+	}
+	if int64(len(p)) > allowed {
+		p = p[:allowed]
+	}
+	n, err := blsr.r.Read(p)
+	blsr.pos += int64(n)
+	return n, err
+}
 
 // Registered formats.
 var formats = make(map[string]Format)

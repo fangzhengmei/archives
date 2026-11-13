@@ -567,3 +567,172 @@ func TestArchiveGrowingFile(t *testing.T) {
 		t.Errorf("Failed to archive file: %v", err)
 	}
 }
+
+// nonSeeker wraps an io.Reader so it no longer implements io.Seeker.
+type nonSeeker struct{ io.Reader }
+
+func newTestTarGz(t *testing.T) []byte {
+	tmpTxtFileName, tmpTxtFileInfo := newTmpTextFile(t, "contents of the archived file")
+	t.Cleanup(func() {
+		os.RemoveAll(tmpTxtFileName)
+	})
+	tarBytes := archive(t, Tar{}, tmpTxtFileName, tmpTxtFileInfo)
+	return compress(t, ".gz", tarBytes, Gz{}.OpenWriter)
+}
+
+// readAllAndCompare reads the stream returned by identification and
+// ensures it reproduces the complete original input exactly once.
+func readAllAndCompare(t *testing.T, stream io.Reader, want []byte) {
+	t.Helper()
+	got, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatalf("reading returned stream: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("returned stream does not reproduce the input: got %d bytes, want %d bytes", len(got), len(want))
+	}
+}
+
+func TestIdentifyWithMaxBytes(t *testing.T) {
+	tarGz := newTestTarGz(t)
+
+	t.Run("sufficient budget identifies nested archive like Identify", func(t *testing.T) {
+		wantFormat, _, err := Identify(context.Background(), "test.tar.gz", bytes.NewReader(tarGz))
+		checkErr(t, err, "identifying without budget")
+
+		format, stream, err := IdentifyWithMaxBytes(context.Background(), "test.tar.gz", nonSeeker{bytes.NewReader(tarGz)}, int64(len(tarGz)))
+		checkErr(t, err, "identifying with sufficient budget")
+		if format.Extension() != wantFormat.Extension() {
+			t.Errorf("expected format %s but got %s", wantFormat.Extension(), format.Extension())
+		}
+		if format.Extension() != ".tar.gz" {
+			t.Errorf("expected nested archive to be identified as .tar.gz but got %s", format.Extension())
+		}
+		readAllAndCompare(t, stream, tarGz)
+	})
+
+	t.Run("no budget behaves like Identify", func(t *testing.T) {
+		for _, maxBytes := range []int64{0, -1} {
+			format, stream, err := IdentifyWithMaxBytes(context.Background(), "test.tar.gz", nonSeeker{bytes.NewReader(tarGz)}, maxBytes)
+			checkErr(t, err, "identifying without a budget")
+			if format.Extension() != ".tar.gz" {
+				t.Errorf("maxBytes=%d: expected .tar.gz but got %s", maxBytes, format.Extension())
+			}
+			readAllAndCompare(t, stream, tarGz)
+		}
+	})
+
+	t.Run("exhausted budget is distinct from NoMatch and stream stays complete", func(t *testing.T) {
+		format, stream, err := IdentifyWithMaxBytes(context.Background(), "test.tar.gz", nonSeeker{bytes.NewReader(tarGz)}, 1)
+		if err == nil {
+			t.Fatalf("expected an error when the budget is exhausted, got format %v", format)
+		}
+		if !errors.Is(err, ErrMaxBytesReached) {
+			t.Errorf("expected ErrMaxBytesReached but got %v", err)
+		}
+		if errors.Is(err, NoMatch) {
+			t.Errorf("exhausted budget must not be reported as NoMatch: %v", err)
+		}
+
+		// the same stream can still be identified and fully extracted afterward,
+		// without repeating or missing any file entries
+		format, stream, err = Identify(context.Background(), "test.tar.gz", stream)
+		checkErr(t, err, "re-identifying the returned stream")
+		var entries []string
+		ex, ok := format.(Extractor)
+		if !ok {
+			t.Fatalf("format %s is not an Extractor", format.Extension())
+		}
+		err = ex.Extract(context.Background(), stream, func(_ context.Context, f FileInfo) error {
+			entries = append(entries, f.NameInArchive)
+			return nil
+		})
+		checkErr(t, err, "extracting after failed bounded identification")
+		if len(entries) != 1 || entries[0] != "tmp.txt" {
+			t.Errorf("expected exactly one entry tmp.txt, got %v", entries)
+		}
+
+		// a fresh bounded identify that fails must also return a complete stream
+		_, stream, err = IdentifyWithMaxBytes(context.Background(), "test.tar.gz", nonSeeker{bytes.NewReader(tarGz)}, 1)
+		if !errors.Is(err, ErrMaxBytesReached) {
+			t.Errorf("expected ErrMaxBytesReached but got %v", err)
+		}
+		readAllAndCompare(t, stream, tarGz)
+	})
+
+	t.Run("no match is not reported as exhausted budget", func(t *testing.T) {
+		content := []byte("this is not a known archive or compression format at all")
+		_, stream, err := IdentifyWithMaxBytes(context.Background(), "file.txt", nonSeeker{bytes.NewReader(content)}, int64(len(content)))
+		if !errors.Is(err, NoMatch) {
+			t.Errorf("expected NoMatch but got %v", err)
+		}
+		if errors.Is(err, ErrMaxBytesReached) {
+			t.Errorf("genuine non-match must not be reported as ErrMaxBytesReached: %v", err)
+		}
+		readAllAndCompare(t, stream, content)
+	})
+
+	t.Run("filename and content mismatch still identified by stream", func(t *testing.T) {
+		// the filename must not collide with a registered format, otherwise
+		// the name match (which is checked per format, in random map order)
+		// can win over the content, just like with plain Identify
+		format, stream, err := IdentifyWithMaxBytes(context.Background(), "misleading.txt", nonSeeker{bytes.NewReader(tarGz)}, int64(len(tarGz)))
+		checkErr(t, err, "identifying with mismatched filename")
+		if format.Extension() != ".tar.gz" {
+			t.Errorf("expected content to win over filename and get .tar.gz but got %s", format.Extension())
+		}
+		readAllAndCompare(t, stream, tarGz)
+	})
+
+	t.Run("seekable input keeps working within budget", func(t *testing.T) {
+		format, stream, err := IdentifyWithMaxBytes(context.Background(), "test.tar.gz", bytes.NewReader(tarGz), int64(len(tarGz)))
+		checkErr(t, err, "identifying a seeker with sufficient budget")
+		if format.Extension() != ".tar.gz" {
+			t.Errorf("expected .tar.gz but got %s", format.Extension())
+		}
+		readAllAndCompare(t, stream, tarGz)
+	})
+
+	t.Run("seekable input with exhausted budget keeps stream complete", func(t *testing.T) {
+		_, stream, err := IdentifyWithMaxBytes(context.Background(), "test.tar.gz", bytes.NewReader(tarGz), 2)
+		if !errors.Is(err, ErrMaxBytesReached) {
+			t.Errorf("expected ErrMaxBytesReached but got %v", err)
+		}
+		readAllAndCompare(t, stream, tarGz)
+	})
+
+	t.Run("corrupt prefix leaves stream complete", func(t *testing.T) {
+		content := []byte("this pretends to be gzip but is not")
+		_, stream, err := IdentifyWithMaxBytes(context.Background(), "corrupt.tar.gz", nonSeeker{bytes.NewReader(content)}, int64(len(content)))
+		if err == nil {
+			t.Error("expected an error for a corrupt gzip prefix")
+		}
+		readAllAndCompare(t, stream, content)
+	})
+
+	t.Run("short input leaves stream complete", func(t *testing.T) {
+		content := []byte{0x1f}
+		_, stream, err := IdentifyWithMaxBytes(context.Background(), "short.bin", nonSeeker{bytes.NewReader(content)}, 1024)
+		if !errors.Is(err, NoMatch) {
+			t.Errorf("expected NoMatch for short input but got %v", err)
+		}
+		readAllAndCompare(t, stream, content)
+
+		// a short input whose filename implies a compression format errors
+		// when the decompressor cannot be opened, but the stream stays complete
+		_, stream, err = IdentifyWithMaxBytes(context.Background(), "short.gz", nonSeeker{bytes.NewReader(content)}, 1024)
+		if err == nil {
+			t.Error("expected an error for a short input with a corrupt gzip prefix")
+		}
+		readAllAndCompare(t, stream, content)
+	})
+
+	t.Run("canceled context leaves stream complete", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		// whether or not identification aborts on the canceled context,
+		// the returned stream must still yield the complete input
+		_, stream, _ := IdentifyWithMaxBytes(ctx, "test.tar.gz", nonSeeker{bytes.NewReader(tarGz)}, 1024)
+		readAllAndCompare(t, stream, tarGz)
+	})
+}
