@@ -92,6 +92,8 @@ func (r Rar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 		options = append(options, rardecode.FileSystem(r.FS))
 	}
 
+	guard := newExtractGuard(ctx)
+
 	var (
 		rr  rarReader
 		err error
@@ -106,6 +108,9 @@ func (r Rar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 			defer or.Close()
 		}
 	} else {
+		// count compressed bytes for ratio enforcement (not possible
+		// when the archive is opened directly by name above)
+		sourceArchive = guard.wrapCompressedReader(sourceArchive)
 		rr, err = rardecode.NewReader(sourceArchive, options...)
 	}
 	if err != nil {
@@ -131,6 +136,9 @@ func (r Rar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 			}
 			return err
 		}
+		if err := guard.addEntry(); err != nil {
+			return err
+		}
 		if fileIsIncluded(skipDirs, hdr.Name) {
 			continue
 		}
@@ -144,6 +152,7 @@ func (r Rar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 				return fileInArchive{io.NopCloser(rr), info}, nil
 			},
 		}
+		file = guard.wrapFileInfo(file)
 
 		err = handleFile(ctx, file)
 		if errors.Is(err, fs.SkipAll) {

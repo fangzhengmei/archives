@@ -242,6 +242,9 @@ func (t Tar) Insert(ctx context.Context, into io.ReadWriteSeeker, files []FileIn
 }
 
 func (t Tar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile FileHandler) error {
+	guard := newExtractGuard(ctx)
+	sourceArchive = guard.wrapCompressedReader(sourceArchive)
+
 	tr := tar.NewReader(sourceArchive)
 
 	// important to initialize to non-nil, empty value due to how fileIsIncluded works
@@ -263,6 +266,9 @@ func (t Tar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 			}
 			return err
 		}
+		if err := guard.addEntry(); err != nil {
+			return err
+		}
 		if fileIsIncluded(skipDirs, hdr.Name) {
 			continue
 		}
@@ -281,6 +287,7 @@ func (t Tar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 				return fileInArchive{io.NopCloser(tr), info}, nil
 			},
 		}
+		file = guard.wrapFileInfo(file)
 
 		err = handleFile(ctx, file)
 		if errors.Is(err, fs.SkipAll) {

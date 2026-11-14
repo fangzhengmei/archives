@@ -284,13 +284,18 @@ func (ca CompressedArchive) Extract(ctx context.Context, sourceArchive io.Reader
 	if ca.Extraction == nil {
 		return fmt.Errorf("no extraction format")
 	}
+	guard := newExtractGuard(ctx)
+	sourceArchive = guard.wrapCompressedReader(sourceArchive)
 	if ca.Compression != nil {
 		rc, err := ca.Compression.OpenReader(sourceArchive)
 		if err != nil {
 			return err
 		}
 		defer rc.Close()
-		sourceArchive = rc
+		// count the bytes produced by the decompressor so that
+		// decompression bombs are caught even if the archive entries
+		// themselves are never read by the handler
+		sourceArchive = guard.wrapDecompressedReadCloser(rc)
 	}
 	return ca.Extraction.Extract(ctx, sourceArchive, handleFile)
 }

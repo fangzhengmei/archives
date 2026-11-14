@@ -201,6 +201,9 @@ func (z Zip) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 		return fmt.Errorf("input type must be an io.ReaderAt and io.Seeker because of zip format constraints")
 	}
 
+	guard := newExtractGuard(ctx)
+	sra = guard.wrapCompressedSeekReaderAt(sra)
+
 	size, err := streamSizeBySeeking(sra)
 	if err != nil {
 		return fmt.Errorf("determining stream size: %w", err)
@@ -208,6 +211,12 @@ func (z Zip) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 
 	zr, err := zip.NewReader(sra, size)
 	if err != nil {
+		return err
+	}
+
+	// the central directory has already been read into memory, so the
+	// entry count can be enforced up front, before any handling occurs
+	if err := guard.addEntries(len(zr.File)); err != nil {
 		return err
 	}
 
@@ -245,6 +254,7 @@ func (z Zip) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 				return fileInArchive{openedFile, info}, nil
 			},
 		}
+		file = guard.wrapFileInfo(file)
 
 		err = handleFile(ctx, file)
 		if errors.Is(err, fs.SkipAll) {
@@ -252,6 +262,11 @@ func (z Zip) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 		} else if errors.Is(err, fs.SkipDir) && file.IsDir() {
 			skipDirs.add(f.Name)
 		} else if err != nil {
+			if errors.Is(err, ErrResourceLimit) {
+				// resource limits are a safety mechanism; never
+				// continue past them, even if configured to do so
+				return fmt.Errorf("handling file %d: %s: %w", i, f.Name, err)
+			}
 			if z.ContinueOnError {
 				log.Printf("[ERROR] %s: %v", f.Name, err)
 				continue

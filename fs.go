@@ -420,11 +420,16 @@ func (f ArchiveFS) Open(name string) (fs.File, error) {
 
 	var decompressor io.ReadCloser
 	if decomp, ok := f.Format.(Decompressor); ok && decomp != nil {
+		// enforce resource limits on the decompression stream, since this
+		// code path bypasses CompressedArchive.Extract which would
+		// otherwise apply them (see the comment below)
+		guard := newExtractGuard(f.context())
+		inputStream = guard.wrapCompressedReader(inputStream)
 		decompressor, err = decomp.OpenReader(inputStream)
 		if err != nil {
 			return nil, err
 		}
-		inputStream = decompressor
+		inputStream = guard.wrapDecompressedReadCloser(decompressor)
 	}
 
 	// prepare the handler that we'll need if we have to iterate the
